@@ -5,8 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from ..errors import PathNotFoundError
+from pydantic import ValidationError
+
+from .. import database as db
+from ..errors import InvalidInputError, PathNotFoundError
 from ..indexer import index_path_async, remove_path
+from ..models import IndexParams, ReindexParams, RemoveParams
 
 _DETAIL_CAP = 200
 
@@ -24,6 +28,11 @@ async def trove_index(path: str) -> dict[str, Any]:
     Skips unchanged files based on checksum comparison.
     For directories, scans recursively and indexes supported files.
     """
+    try:
+        path = IndexParams(path=path).path
+    except ValidationError as exc:
+        raise InvalidInputError(str(exc)) from exc
+
     target = Path(path).resolve()
     if not target.exists():
         raise PathNotFoundError(path)
@@ -55,7 +64,10 @@ async def trove_reindex(path: str | None = None) -> dict[str, Any]:
 
     If no path given, reindexes all previously indexed files.
     """
-    from .. import database as db
+    try:
+        path = ReindexParams(path=path).path
+    except ValidationError as exc:
+        raise InvalidInputError(str(exc)) from exc
 
     if path:
         target = Path(path).resolve()
@@ -70,17 +82,17 @@ async def trove_reindex(path: str | None = None) -> dict[str, Any]:
             if file_path.exists():
                 results.extend(await index_path_async(file_path, force=True))
             else:
-                existing = db.query_one(
-                    "SELECT id FROM files WHERE path = ?", (row["path"],)
-                )
+                existing = db.query_one("SELECT id FROM files WHERE path = ?", (row["path"],))
                 if existing:
                     db.delete_file_data(existing["id"])
-                    results.append({
-                        "path": row["path"],
-                        "status": "removed",
-                        "reason": "file_missing",
-                        "chunk_count": 0,
-                    })
+                    results.append(
+                        {
+                            "path": row["path"],
+                            "status": "removed",
+                            "reason": "file_missing",
+                            "chunk_count": 0,
+                        }
+                    )
 
     indexed = sum(1 for r in results if r["status"] == "indexed")
     removed = sum(1 for r in results if r.get("status") == "removed")
@@ -106,6 +118,11 @@ async def trove_remove(path: str) -> dict[str, Any]:
 
     Deletes all associated chunks and vector embeddings.
     """
+    try:
+        path = RemoveParams(path=path).path
+    except ValidationError as exc:
+        raise InvalidInputError(str(exc)) from exc
+
     target = Path(path).resolve()
     result = remove_path(target)
     return {

@@ -6,16 +6,17 @@ Uses sqlite-vec for vector search and FTS5 for keyword search.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from typing import Any
 
 import sqlite_vec
 
 from .config import get_config
+from .embedder import get_vector_dims
+from .errors import DimensionMismatchError
 
 _db: sqlite3.Connection | None = None
-
-VECTOR_DIMS = 384
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
@@ -87,12 +88,25 @@ CREATE INDEX IF NOT EXISTS idx_errors_path ON index_errors(path);
 CREATE INDEX IF NOT EXISTS idx_errors_resolved ON index_errors(resolved);
 """
 
-VEC_TABLE_SQL = f"""
+VEC_TABLE_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
     chunk_id INTEGER PRIMARY KEY,
-    embedding float[{VECTOR_DIMS}]
+    embedding float[{dims}]
 );
 """
+
+
+def _ensure_vec_table(conn: sqlite3.Connection) -> None:
+    """Create chunks_vec for the configured model, or verify an existing one matches."""
+    model_name = get_config().embedding_model
+    model_dims = get_vector_dims(model_name)
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'chunks_vec'").fetchone()
+    if row is None:
+        conn.execute(VEC_TABLE_SQL.format(dims=model_dims))
+        return
+    match = re.search(r"float\[(\d+)\]", row[0])
+    if match and int(match.group(1)) != model_dims:
+        raise DimensionMismatchError(int(match.group(1)), model_name, model_dims)
 
 
 def _migrate_add_mtime(conn: sqlite3.Connection) -> None:
@@ -118,7 +132,12 @@ def get_db(db_path: str | None = None) -> sqlite3.Connection:
         sqlite_vec.load(_db)
         _db.enable_load_extension(False)
         _db.executescript(SCHEMA)
-        _db.execute(VEC_TABLE_SQL)
+        try:
+            _ensure_vec_table(_db)
+        except Exception:
+            _db.close()
+            _db = None
+            raise
         _migrate_add_mtime(_db)
         _db.commit()
     return _db
@@ -163,8 +182,7 @@ def insert_file(
 ) -> int:
     """Insert a file record and return its ID."""
     return execute(
-        "INSERT INTO files (path, checksum, file_type, file_size, mtime) "
-        "VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO files (path, checksum, file_type, file_size, mtime) VALUES (?, ?, ?, ?, ?)",
         (path, checksum, file_type, file_size, mtime),
     )
 
@@ -195,11 +213,7 @@ def update_file_mtime(file_id: int, mtime: float) -> None:
 def delete_file_data(file_id: int) -> None:
     """Delete all chunks and vectors for a file, then the file record."""
     db = get_db()
-    chunk_ids = [
-        row["id"] for row in query(
-            "SELECT id FROM chunks WHERE file_id = ?", (file_id,)
-        )
-    ]
+    chunk_ids = [row["id"] for row in query("SELECT id FROM chunks WHERE file_id = ?", (file_id,))]
     for chunk_id in chunk_ids:
         db.execute("DELETE FROM chunks_vec WHERE chunk_id = ?", (chunk_id,))
     db.execute("DELETE FROM chunks WHERE file_id = ?", (file_id,))
@@ -216,8 +230,7 @@ def insert_chunk(
     """Insert a text chunk and return its ID."""
     meta_json = json.dumps(metadata) if metadata else None
     return execute(
-        "INSERT INTO chunks (file_id, chunk_index, content, metadata) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO chunks (file_id, chunk_index, content, metadata) VALUES (?, ?, ?, ?)",
         (file_id, chunk_index, content, meta_json),
     )
 
@@ -388,12 +401,14 @@ def classify_error(error_message: str) -> str:
 
 
 def insert_error(
-    run_id: int | None, path: str, error_message: str, error_type: str,
+    run_id: int | None,
+    path: str,
+    error_message: str,
+    error_type: str,
 ) -> int:
     """Record a per-file indexing failure."""
     return execute(
-        "INSERT INTO index_errors (run_id, path, error_message, error_type) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO index_errors (run_id, path, error_message, error_type) VALUES (?, ?, ?, ?)",
         (run_id, path, error_message, error_type),
     )
 
@@ -434,7 +449,7 @@ def query_errors(
     params.append(limit)
 
     return query(
-        f"SELECT id, run_id, path, error_message, error_type, "  # noqa: S608
+        f"SELECT id, run_id, path, error_message, error_type, "
         f"created_at, resolved_at, resolved "
         f"FROM index_errors {where} "
         f"ORDER BY created_at DESC LIMIT ?",

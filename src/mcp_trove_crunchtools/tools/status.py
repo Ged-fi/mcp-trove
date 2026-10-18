@@ -6,9 +6,16 @@ import json
 from collections import Counter
 from typing import Any
 
+from pydantic import ValidationError
+
 from .. import database as db
 from ..config import get_config
-from ..errors import FileNotIndexedError
+from ..errors import FileNotIndexedError, InvalidInputError
+from ..models import GetChunksParams, ListParams, LogParams, QualityParams
+
+# Effectively "all" errors for the total/resolved/unresolved counts below --
+# a practical upper bound on a per-file error log, not a paginated result.
+_QUALITY_SUMMARY_SCAN_LIMIT = 10_000
 
 
 async def trove_status() -> dict[str, Any]:
@@ -22,13 +29,9 @@ async def trove_status() -> dict[str, Any]:
         "FROM files"
     )
 
-    type_counts = db.query(
-        "SELECT file_type, COUNT(*) as count FROM files GROUP BY file_type"
-    )
+    type_counts = db.query("SELECT file_type, COUNT(*) as count FROM files GROUP BY file_type")
 
-    last_indexed = db.query_one(
-        "SELECT indexed_at FROM files ORDER BY indexed_at DESC LIMIT 1"
-    )
+    last_indexed = db.query_one("SELECT indexed_at FROM files ORDER BY indexed_at DESC LIMIT 1")
 
     last_run = db.query_one(
         "SELECT id, started_at, finished_at, path, status, "
@@ -57,6 +60,12 @@ async def trove_list(
     offset: int = 0,
 ) -> list[dict[str, Any]]:
     """List indexed files with metadata."""
+    try:
+        params = ListParams(path=path, limit=limit, offset=offset)
+    except ValidationError as exc:
+        raise InvalidInputError(str(exc)) from exc
+    path, limit, offset = params.path, params.limit, params.offset
+
     if path:
         files = db.query(
             "SELECT id, path, file_type, file_size, chunk_count, indexed_at "
@@ -86,6 +95,12 @@ async def trove_list(
 
 async def trove_log(limit: int = 20) -> list[dict[str, Any]]:
     """Return recent index runs from the activity log."""
+    try:
+        params = LogParams(limit=limit)
+    except ValidationError as exc:
+        raise InvalidInputError(str(exc)) from exc
+    limit = params.limit
+
     rows = db.query(
         "SELECT id, started_at, finished_at, path, status, "
         "files_found, files_indexed, files_skipped, files_errored, "
@@ -101,9 +116,13 @@ async def trove_get_chunks(
     limit: int = 50,
 ) -> list[dict[str, Any]]:
     """Show the text chunks for a specific indexed file."""
-    existing = db.query_one(
-        "SELECT id FROM files WHERE path = ?", (file_path,)
-    )
+    try:
+        params = GetChunksParams(file_path=file_path, limit=limit)
+    except ValidationError as exc:
+        raise InvalidInputError(str(exc)) from exc
+    file_path, limit = params.file_path, params.limit
+
+    existing = db.query_one("SELECT id FROM files WHERE path = ?", (file_path,))
     if not existing:
         raise FileNotIndexedError(file_path)
 
@@ -131,10 +150,16 @@ async def trove_quality(
     limit: int = 100,
 ) -> dict[str, Any]:
     """Per-file error summary and details from indexing runs."""
+    try:
+        params = QualityParams(path=path, show_resolved=show_resolved, limit=limit)
+    except ValidationError as exc:
+        raise InvalidInputError(str(exc)) from exc
+    path, show_resolved, limit = params.path, params.show_resolved, params.limit
+
     resolved_filter: bool | None = None if show_resolved else False
     errors = db.query_errors(resolved=resolved_filter, path=path, limit=limit)
 
-    all_errors = db.query_errors(resolved=None, path=path, limit=10_000)
+    all_errors = db.query_errors(resolved=None, path=path, limit=_QUALITY_SUMMARY_SCAN_LIMIT)
     total = len(all_errors)
     resolved_count = sum(1 for e in all_errors if e["resolved"])
     unresolved_count = total - resolved_count
