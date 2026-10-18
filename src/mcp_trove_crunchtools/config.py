@@ -74,7 +74,7 @@ class Config:
 
 
 def _parse_paths(raw: str) -> list[str]:
-    """Parse colon-separated directory paths."""
+    """Parse directory paths separated by os.pathsep (":" on POSIX, ";" on Windows)."""
     if not raw.strip():
         return []
     return [p.strip() for p in raw.split(os.pathsep) if p.strip()]
